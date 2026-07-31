@@ -41,4 +41,3 @@ outputs/models/*
 .DS_Store
 Thumbs.db
 
-*.csv
