@@ -46,3 +46,8 @@ outputs/**/__temp*
 outputs/이상치 결측치/데이터 유효성 검사.ipynb
 outputs/통계검정3_기존빈파일
 
+# Reproducible strategy comparison artifacts
+outputs/strate_comparison/*.html
+outputs/strate_comparison/*.png
+outputs/strate_comparison/batch_summary.csv
+
