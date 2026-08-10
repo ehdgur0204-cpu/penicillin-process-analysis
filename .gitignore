@@ -41,4 +41,5 @@ outputs/models/*
 .DS_Store
 Thumbs.db
 
+# CSV 데이터는 GitHub에 업로드하지 않음
 *.csv
