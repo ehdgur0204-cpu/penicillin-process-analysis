@@ -245,7 +245,14 @@ def get_deviation_result(df, golden_profiles, batch_id, current_time):
 
     last_idx = -1
     top3_scores = {col: float(per_feat_scores[col][last_idx]) for col in SMAPE_COLS}
-    top3 = sorted(top3_scores.items(), key=lambda x: x[1], reverse=True)[:3]
+    # NaN(실측값·골든평균이 둘 다 0에 가까워 SMAPE 정의 불가한 지점, 주로 레시피
+    # 고정형 변수가 0인 구간)이 정렬 시 부정확하게 상위로 섞여 들어가는 것을 방지.
+    # -inf로 취급해 항상 최하위로 보내는 것으로 수정 (버그 수정, 공식/판정 로직 변경 아님).
+    top3 = sorted(
+        top3_scores.items(),
+        key=lambda x: x[1] if not np.isnan(x[1]) else float("-inf"),
+        reverse=True,
+    )[:3]
 
     return {
         "batch_id": int(batch_id),
@@ -257,6 +264,121 @@ def get_deviation_result(df, golden_profiles, batch_id, current_time):
         "threshold": float(threshold_curve[last_idx]),
         "status": status,
         "top3": top3,
+    }
+
+
+# --------------------------------------------
+# PAGE2(이탈 상세진단) 화면용 확장 함수
+# get_deviation_result()의 확정 로직(11개 변수 SMAPE + 전략별 2.5σ + 1지점 주의/2지점 이상 경고)은
+# 그대로 재사용하고, 여기에 화면에 필요한 시계열/지속시간 정보만 추가로 계산한다.
+# (SMAPE 공식·임계값·판정기준 자체는 변경하지 않음)
+# --------------------------------------------
+
+def get_deviation_history(df, golden_profiles, batch_id, current_time):
+    """
+    PAGE2 상세진단 화면(그래프 + 최초신호 + 지속이탈)에 필요한 시계열 정보를 반환합니다.
+
+    반환:
+        {
+            "batch_id", "strategy", "comparison_strategy", "current_time", "progress",
+            "points_time": 각 보간 지점의 실제 발효시간(h) 배열,
+            "deviation_curve": 지점별 종합 이탈점수(SMAPE 평균) 배열,
+            "threshold_curve": 지점별 임계값 배열,
+            "warning_flag": 지점별 경고(연속 2지점 이상 초과) bool 배열,
+            "caution_flag": 지점별 주의(1지점만 초과) bool 배열,
+            "first_signal_time": 현재 이어지고 있는 이탈이 시작된 시점(h). 이탈 중이 아니면 None,
+            "persist_hours": 그 시작 시점부터 현재까지 지속된 시간(h). 이탈 중이 아니면 0.0,
+            "variables": {
+                변수명: {"time": 실측 시간 배열, "actual": 실측값 배열,
+                          "golden_mean": 골든 평균(같은 시간 배열 기준), "golden_std": 골든 표준편차}
+                for 변수명 in SMAPE_COLS
+            },
+        }
+        해당 batch_id / current_time 조합이 유효하지 않으면 None.
+    """
+    batch_df = df[df[BATCH_COL] == batch_id].sort_values(TIME_COL)
+    if batch_df.empty:
+        return None
+
+    strategy = str(batch_df[STRATEGY_COL].iloc[0])
+    comparison_strategy = _get_comparison_strategy(batch_id, strategy)
+    if comparison_strategy is None:
+        return None
+
+    sub = batch_df[batch_df[TIME_COL] <= current_time]
+    if sub.empty:
+        return None
+
+    mean_duration = STRATEGY_MEAN_DURATION[comparison_strategy]
+    current_progress = float(min(current_time / mean_duration, 1.0))
+
+    points_mask = COMMON_POINTS <= current_progress
+    points = COMMON_POINTS[points_mask]
+    if len(points) == 0:
+        points = COMMON_POINTS[:1]
+        points_mask[0] = True
+    points_time = points * mean_duration
+
+    golden_profile = golden_profiles[comparison_strategy]
+    golden_ref_means = {col: golden_profile[f"{col}_mean"].to_numpy()[points_mask] for col in SMAPE_COLS}
+    golden_ref_stds = {col: golden_profile[f"{col}_std"].to_numpy()[points_mask] for col in SMAPE_COLS}
+
+    progress_known = np.minimum(sub[TIME_COL].to_numpy() / mean_duration, 1.0)
+
+    per_feat_scores = {}
+    per_feat_actual = {}
+    for col in SMAPE_COLS:
+        actual = _interpolate_to_points(progress_known, sub[col].to_numpy(), points, col)
+        per_feat_actual[col] = actual
+        ref_mean = golden_ref_means[col]
+        denom = np.abs(actual) + np.abs(ref_mean)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            score = np.where(denom < 1e-6, np.nan, np.abs(actual - ref_mean) / denom)
+        per_feat_scores[col] = score
+
+    deviation_curve = np.nanmean(np.array(list(per_feat_scores.values())), axis=0)
+
+    thresholds = _get_thresholds(df, golden_profiles)
+    threshold_curve = thresholds[comparison_strategy][points_mask]
+
+    raw_flag = deviation_curve > threshold_curve
+    warning_flag = _filter_min_run(raw_flag, MIN_RUN)
+    caution_flag = raw_flag & ~warning_flag
+
+    # 현재(마지막 지점)부터 거슬러 올라가며 raw_flag가 계속 True인 구간의 시작점을 찾음
+    # (get_alarm_flag/get_warning_flag과 동일하게 "연속 초과"를 기준으로 함)
+    first_signal_time = None
+    persist_hours = 0.0
+    if raw_flag[-1]:
+        start_idx = len(raw_flag) - 1
+        while start_idx > 0 and raw_flag[start_idx - 1]:
+            start_idx -= 1
+        first_signal_time = float(points_time[start_idx])
+        persist_hours = float(points_time[-1] - points_time[start_idx])
+
+    variables = {}
+    for col in SMAPE_COLS:
+        variables[col] = {
+            "time": points_time.tolist(),
+            "actual": per_feat_actual[col].tolist(),
+            "golden_mean": golden_ref_means[col].tolist(),
+            "golden_std": golden_ref_stds[col].tolist(),
+        }
+
+    return {
+        "batch_id": int(batch_id),
+        "strategy": strategy,
+        "comparison_strategy": comparison_strategy,
+        "current_time": float(current_time),
+        "progress": round(current_progress * 100, 1),
+        "points_time": points_time.tolist(),
+        "deviation_curve": deviation_curve.tolist(),
+        "threshold_curve": threshold_curve.tolist(),
+        "warning_flag": warning_flag.tolist(),
+        "caution_flag": caution_flag.tolist(),
+        "first_signal_time": first_signal_time,
+        "persist_hours": persist_hours,
+        "variables": variables,
     }
 
 
@@ -277,3 +399,11 @@ if __name__ == "__main__":
     assert result["strategy"] == "Fault"
     assert result["comparison_strategy"] == "APC"
     print("스모크 테스트 통과")
+
+    print("=== get_deviation_history / Fault91 / 88.6h ===")
+    history = get_deviation_history(df, golden_profiles, batch_id=91, current_time=88.6)
+    print("최초 신호 시점(h):", history["first_signal_time"])
+    print("지속 이탈(h):", history["persist_hours"])
+    print("포인트 수:", len(history["points_time"]))
+    print("변수 목록:", list(history["variables"].keys()))
+    print("PAGE2 확장 함수 스모크 테스트 통과")
